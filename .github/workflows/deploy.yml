@@ -1,0 +1,130 @@
+name: Deploy
+
+# Manual only. Último da cadeia: infra-k8s -> infra-db -> app -> lambda.
+# Depois da app porque o usuário MySQL da Lambda é criado pelo job rds-user-setup dela.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: lambda
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  AWS_REGION: us-east-1
+  TF_STATE_KEY: tech-challenge/lambda.tfstate
+  SSM_PREFIX: /tech-challenge
+
+jobs:
+  deploy:
+    name: Testes, build e Terraform apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require master branch
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/master" ]; then
+            echo "Rode este workflow com a branch master selecionada."
+            exit 1
+          fi
+
+      - name: Require secrets and variables
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_LOCK_TABLE: ${{ vars.TF_STATE_LOCK_TABLE }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          LAMBDA_DB_PASSWORD: ${{ secrets.LAMBDA_DB_PASSWORD }}
+        run: |
+          set -eu
+          missing=0
+          for name in TF_STATE_BUCKET TF_STATE_LOCK_TABLE JWT_SECRET LAMBDA_DB_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::${name} ausente. Defina em Settings > Secrets and variables > Actions (README.md)."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN_APPLY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Fail-fast do contrato. app/ não é lido pelo Terraform, mas sem ele o usuário MySQL
+      # da Lambda ainda não existe e a função sobe respondendo 503.
+      - name: Require upstream contract
+        run: |
+          set -eu
+          missing=0
+          for name in network/vpc_id network/private_subnet_ids apigw/api_id apigw/execution_arn apigw/invoke_url \
+                      db/address db/port db/name db/security_group_id; do
+            if ! aws ssm get-parameter --name "${SSM_PREFIX}/${name}" >/dev/null 2>&1; then
+              echo "::error::${SSM_PREFIX}/${name} não existe. Rode o Deploy do infra-k8s e do infra-db antes."
+              missing=1
+            fi
+          done
+          if [ -z "$(aws ssm get-parameters-by-path --path "${SSM_PREFIX}/app" --query 'Parameters[].Name' --output text)" ]; then
+            echo "::error::Nada em ${SSM_PREFIX}/app. Rode o Deploy do tech-chalange antes (ele cria o usuário MySQL da Lambda)."
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Run tests
+        run: |
+          npm ci
+          npm test
+
+      # build/ = src + package.json + node_modules de produção (mysql2), zipado pelo archive_file.
+      - name: Build package
+        run: npm run build
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform plan
+        working-directory: terraform
+        env:
+          TF_VAR_jwt_secret: ${{ secrets.JWT_SECRET }}
+          TF_VAR_lambda_db_password: ${{ secrets.LAMBDA_DB_PASSWORD }}
+        run: terraform plan -var-file=env/aws.tfvars -out=tfplan -no-color
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Summary
+        working-directory: terraform
+        run: |
+          {
+            echo "### POST $(terraform output -raw autenticacao_url)"
+            echo
+            echo "Logs no New Relic: $(terraform output -raw newrelic_logs_enabled)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,84 @@
+openapi: 3.0.3
+info:
+  title: Tech Challenge - Autenticação
+  description: |
+    Lambda de autenticação por CPF/CNPJ. Emite o JWT aceito pelas rotas protegidas da
+    API PHP (tech-chalange), enviado como `Authorization: Bearer <token>`.
+  version: 1.0.0
+servers:
+  - url: "{apiGatewayUrl}"
+    description: "API Gateway (output api_gateway_url do tech-challenge-infra-k8s)"
+    variables:
+      apiGatewayUrl:
+        default: https://<api-id>.execute-api.us-east-1.amazonaws.com
+paths:
+  /autenticacao:
+    post:
+      summary: Autenticar cliente por CPF ou CNPJ
+      operationId: autenticar
+      tags: [Autenticação]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cpf_cnpj:
+                  type: string
+                  description: CPF ou CNPJ (com ou sem máscara; CNPJ alfanumérico aceito).
+                  example: 529.982.247-25
+                cpf:
+                  type: string
+                  deprecated: true
+                  description: Alias do contrato original; `cpf_cnpj` tem prioridade.
+      responses:
+        "200":
+          description: Cliente cadastrado; token emitido.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token:
+                    type: string
+                  token_type:
+                    type: string
+                    example: Bearer
+                  expires_in:
+                    type: integer
+                    example: 3600
+        "400":
+          description: Sem `cpf_cnpj` (string) ou JSON inválido.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Erro" }
+        "401":
+          description: CPF/CNPJ inválido.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Erro" }
+        "404":
+          description: CPF/CNPJ válido, mas cliente não cadastrado.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Erro" }
+        "500":
+          description: "`JWT_SECRET` ou `DB_*` ausentes na função."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Erro" }
+        "503":
+          description: Falha ao consultar o banco.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Erro" }
+components:
+  schemas:
+    Erro:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
